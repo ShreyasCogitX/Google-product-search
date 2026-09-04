@@ -25,7 +25,8 @@ class Config(BaseModel):
     SEARCH_LANGUAGE: str = "en"
 
     # --- Playwright ---
-    PLAYWRIGHT_TIMEOUT_MS: int = 15000
+    PLAYWRIGHT_TIMEOUT_MS: int = 5000  # Reduced to 5 seconds for faster fallback
+    PLAYWRIGHT_HEADLESS: bool = True
     PLAYWRIGHT_HEADLESS: bool = True
 
     # --- Limits ---
