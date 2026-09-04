@@ -31,7 +31,7 @@ class Config(BaseModel):
 
     # --- Limits ---
     MAX_PRODUCTS: int = 5
-    MAX_QUERY_CONCURRENCY: int = 4
+    MAX_QUERY_CONCURRENCY: int = 12  # boosted parallelism for queries
     MAX_PRODUCT_CONCURRENCY: int = 5
     MAX_BATCH_QUERIES: int = 10
 
