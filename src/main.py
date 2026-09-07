@@ -30,17 +30,12 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-app = FastAPI(
-    title="Google Product Search Tool",
-    description="AI Agent tool for dynamic product discovery and parsing via Google Search and Playwright",
-    version="2.0.0",
-)
-
 logger = logging.getLogger("google_product_search")
 
 # --- Request queue system ---
 import asyncio
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 # Global async queue: each entry is (callable, Future)
@@ -72,13 +67,11 @@ def _ensure_worker_running() -> None:
         except RuntimeError:
             pass
 
-@app.on_event("startup")
-async def _start_queue_worker() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     _ensure_worker_running()
     logger.info("Request queue worker started")
-
-@app.on_event("shutdown")
-async def _stop_queue_worker() -> None:
+    yield
     global _worker_task
     if _worker_task and not _worker_task.done():
         _worker_task.cancel()
@@ -87,6 +80,13 @@ async def _stop_queue_worker() -> None:
         except asyncio.CancelledError:
             pass
         logger.info("Request queue worker cancelled")
+
+app = FastAPI(
+    title="Google Product Search Tool",
+    description="AI Agent tool for dynamic product discovery and parsing via Google Search and Playwright",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 
 # ── Legacy single-query endpoint ──────────────────────────────────────────────
@@ -225,12 +225,18 @@ def main() -> None:
         default=8000,
         help="Server port number (default 8000)."
     )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        default=False,
+        help="Enable auto-reload for development (default False)."
+    )
 
     args = parser.parse_args()
 
     if args.serve:
-        logger.info("Starting FastAPI server on %s:%d", args.host, args.port)
-        uvicorn.run("main:app", host=args.host, port=args.port, reload=True)
+        logger.info("Starting FastAPI server on %s:%d (reload=%s)", args.host, args.port, args.reload)
+        uvicorn.run("main:app", host=args.host, port=args.port, reload=args.reload)
     elif args.query:
         # Load dotenv if present
         try:
