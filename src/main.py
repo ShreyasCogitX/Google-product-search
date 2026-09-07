@@ -29,13 +29,64 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("google_product_search")
 
 app = FastAPI(
     title="Google Product Search Tool",
     description="AI Agent tool for dynamic product discovery and parsing via Google Search and Playwright",
     version="2.0.0",
 )
+
+logger = logging.getLogger("google_product_search")
+
+# --- Request queue system ---
+import asyncio
+from collections.abc import Callable
+from typing import Any
+
+# Global async queue: each entry is (callable, Future)
+request_queue: asyncio.Queue[tuple[Callable[[], Any], asyncio.Future]] = asyncio.Queue()
+
+async def _queue_worker() -> None:
+    while True:
+        func, fut = await request_queue.get()
+        try:
+            result = func()
+            if asyncio.iscoroutine(result):
+                result = await result
+            if not fut.done():
+                fut.set_result(result)
+        except Exception as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+        finally:
+            request_queue.task_done()
+
+_worker_task: asyncio.Task | None = None
+
+def _ensure_worker_running() -> None:
+    global _worker_task
+    if _worker_task is None or _worker_task.done():
+        try:
+            loop = asyncio.get_running_loop()
+            _worker_task = loop.create_task(_queue_worker())
+        except RuntimeError:
+            pass
+
+@app.on_event("startup")
+async def _start_queue_worker() -> None:
+    _ensure_worker_running()
+    logger.info("Request queue worker started")
+
+@app.on_event("shutdown")
+async def _stop_queue_worker() -> None:
+    global _worker_task
+    if _worker_task and not _worker_task.done():
+        _worker_task.cancel()
+        try:
+            await _worker_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Request queue worker cancelled")
 
 
 # ── Legacy single-query endpoint ──────────────────────────────────────────────
@@ -59,8 +110,11 @@ async def search_endpoint(request: SearchRequest):
     """Expose the google_product_search tool over HTTP (single query, backward compatible)."""
     logger.info("Received POST /search request for query: '%s'", request.query)
     try:
-        result = google_product_search(query=request.query, limit=request.limit)
-        return result
+        _ensure_worker_running()
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        await request_queue.put((lambda: google_product_search(query=request.query, limit=request.limit), fut))
+        return await fut
     except Exception as exc:
         logger.exception("HTTP search endpoint failed")
         raise HTTPException(status_code=500, detail=str(exc))
@@ -111,12 +165,15 @@ async def api_search_endpoint(request: TextSearchRequest):
         repr(request.text), repr(request.queries)
     )
     try:
-        result = google_product_search(
+        _ensure_worker_running()
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        await request_queue.put((lambda: google_product_search(
             query=request.text,
             queries=request.queries,
             limit=request.limit,
-        )
-        return result
+        ), fut))
+        return await fut
     except Exception as exc:
         logger.exception("HTTP /api/search endpoint failed")
         raise HTTPException(status_code=500, detail=str(exc))

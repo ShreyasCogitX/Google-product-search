@@ -35,6 +35,10 @@ class Config(BaseModel):
     MAX_PRODUCT_CONCURRENCY: int = 5
     MAX_BATCH_QUERIES: int = 10
 
+    # New configs for performance tuning
+    PLAYWRIGHT_DOM_WAIT_MS: int = 1500  # milliseconds to wait for DOM after navigation
+    HTTP_RETRY_COUNT: int = 1  # additional HTTP attempts before Playwright fallback
+
     @classmethod
     def load(cls) -> "Config":
         """Load configuration from environment variables, raising if required keys are missing."""

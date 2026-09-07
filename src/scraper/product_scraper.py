@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import httpx
-# Playwright imports removed – using async HTTP only
+from playwright.async_api import async_playwright, BrowserContext, Page
 
 from .jsonld_parser import extract_jsonld_product, _find_product_in_jsonld, _flatten_product, _flatten_product_group
 from .embedded_json_parser import extract_embedded_product, find_product_data
@@ -137,9 +137,13 @@ class ProductScraper:
         headless: bool = True,
         timeout_ms: int = 15000,
         max_concurrent: int = 3,
+        dom_wait_ms: int = 1500,
+        http_retry_count: int = 1,
     ) -> None:
         self._headless = headless
         self._timeout_ms = timeout_ms
+        self._dom_wait_ms = dom_wait_ms
+        self._http_retry_count = http_retry_count
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
     async def scrape_products(
@@ -265,61 +269,73 @@ class ProductScraper:
             logger.info("HTTP request start for URL: %s", url)
             http_start_time = time.time()
             try:
-                # HTTP fetch
-                response = await http_client.get(url)
-                status_code = response.status_code
-                http_duration = time.time() - http_start_time
-                
-                # Check status
-                if status_code == 200:
-                    html_content = response.text
-                    html_size = len(response.content)
-                    
-                    # 1. JSON-LD parsing
-                    jsonld_start = time.time()
-                    jsonld_data = None
+                response = None
+                max_attempts = max(1, self._http_retry_count + 1)
+                for attempt in range(max_attempts):
                     try:
-                        jsonld_data = extract_jsonld_product(html_content)
+                        response = await http_client.get(url)
+                        if response.status_code == 200:
+                            break
                     except Exception as e:
-                        logger.debug("HTTP JSON-LD extraction error: %s", e)
-                    jsonld_duration = time.time() - jsonld_start
+                        if attempt == max_attempts - 1:
+                            raise e
+                        await asyncio.sleep(0.2)
 
-                    if jsonld_data and jsonld_data.get("name") and str(jsonld_data["name"]).strip():
-                        merged = jsonld_data
-                        method = "http_jsonld"
-                    else:
-                        # 2. Embedded JSON parsing
-                        embedded_start = time.time()
-                        embedded_data = None
-                        try:
-                            embedded_data = extract_embedded_product(html_content)
-                        except Exception as e:
-                            logger.debug("HTTP Embedded JSON extraction error: %s", e)
-                        embedded_duration = time.time() - embedded_start
-
-                        if embedded_data and embedded_data.get("name") and str(embedded_data["name"]).strip():
-                            merged = embedded_data
-                            method = "http_embedded_json"
-                        else:
-                            # 3. HTML parsing (BeautifulSoup DOM) fallback
-                            html_start = time.time()
-                            html_data = None
-                            try:
-                                html_data = extract_html_product(html_content, url)
-                            except Exception as e:
-                                logger.debug("HTTP HTML DOM extraction error: %s", e)
-                            html_parsing_duration = time.time() - html_start
-
-                            if html_data and html_data.get("name") and str(html_data["name"]).strip():
-                                merged = html_data
-                                method = "http_html_fallback"
-                            else:
-                                logger.info("HTTP extraction failed to find valid name. Falling back to Playwright.")
-                                playwright_fallback = True
+                if response is not None:
+                    status_code = response.status_code
+                    http_duration = time.time() - http_start_time
                     
-                    total_http_duration = time.time() - http_start_time
+                    if status_code == 200:
+                        html_content = response.text
+                        html_size = len(response.content)
+                        
+                        # 1. JSON-LD parsing
+                        jsonld_start = time.time()
+                        jsonld_data = None
+                        try:
+                            jsonld_data = extract_jsonld_product(html_content)
+                        except Exception as e:
+                            logger.debug("HTTP JSON-LD extraction error: %s", e)
+                        jsonld_duration = time.time() - jsonld_start
+
+                        if jsonld_data and jsonld_data.get("name") and str(jsonld_data["name"]).strip():
+                            merged = jsonld_data
+                            method = "http_jsonld"
+                        else:
+                            # 2. Embedded JSON parsing
+                            embedded_start = time.time()
+                            embedded_data = None
+                            try:
+                                embedded_data = extract_embedded_product(html_content)
+                            except Exception as e:
+                                logger.debug("HTTP Embedded JSON extraction error: %s", e)
+                            embedded_duration = time.time() - embedded_start
+
+                            if embedded_data and embedded_data.get("name") and str(embedded_data["name"]).strip():
+                                merged = embedded_data
+                                method = "http_embedded_json"
+                            else:
+                                # 3. HTML parsing (BeautifulSoup DOM) fallback
+                                html_start = time.time()
+                                html_data = None
+                                try:
+                                    html_data = extract_html_product(html_content, url)
+                                except Exception as e:
+                                    logger.debug("HTTP HTML DOM extraction error: %s", e)
+                                html_parsing_duration = time.time() - html_start
+
+                                if html_data and html_data.get("name") and str(html_data["name"]).strip():
+                                    merged = html_data
+                                    method = "http_html_fallback"
+                                else:
+                                    logger.info("HTTP extraction failed to find valid name. Falling back to Playwright.")
+                                    playwright_fallback = True
+                        
+                        total_http_duration = time.time() - http_start_time
+                    else:
+                        logger.warning("HTTP status %s for %s. Falling back to Playwright.", status_code, url)
+                        playwright_fallback = True
                 else:
-                    logger.warning("HTTP status %s for %s. Falling back to Playwright.", status_code, url)
                     playwright_fallback = True
             except Exception as exc:
                 http_duration = time.time() - http_start_time
@@ -360,8 +376,7 @@ class ProductScraper:
                         exc,
                     )
 
-                # --- Unified Target Waiting ---
-                # Wait up to 1.5s for basic content or tags to load in the DOM
+                # Wait for basic content or tags to load in the DOM
                 try:
                     await page.wait_for_function(
                         """() => {
@@ -384,120 +399,47 @@ class ProductScraper:
 
                             return false;
                         }""",
-                        timeout=1500
+                        timeout=self._dom_wait_ms
                     )
                 except Exception:
                     pass
 
-                pw_extract_start = time.time()
-                pw_jsonld = None
-                pw_embedded = None
-                pw_dom = None
+                # Playwright loads the webpage; extract the fully rendered HTML and parse with BeautifulSoup pipeline
+                logger.info("Playwright loaded webpage; extracting rendered HTML for BeautifulSoup parsing.")
+                content = await page.content()
 
-                # 1. Primary Playwright Extraction: JSON-LD from DOM
+                # 1. JSON-LD parsing on rendered HTML
                 try:
-                    script_texts = await page.locator('script[type="application/ld+json"]').all_text_contents()
-                    pw_jsonld = extract_product_from_jsonld_strings(script_texts)
+                    jsonld_data = extract_jsonld_product(content)
+                    if jsonld_data and jsonld_data.get("name") and str(jsonld_data["name"]).strip():
+                        merged = jsonld_data
+                        method = "playwright_rendered_jsonld"
                 except Exception as e:
-                    logger.debug("Playwright JSON-LD extraction failed: %s", e)
+                    logger.debug("Playwright rendered JSON-LD extraction failed: %s", e)
 
-                if pw_jsonld and pw_jsonld.get("name") and str(pw_jsonld["name"]).strip():
-                    merged = pw_jsonld
-                    method = "playwright_jsonld"
-                else:
-                    # 2. Primary Playwright Extraction: Embedded State from DOM
+                # 2. Embedded JSON parsing on rendered HTML
+                if not merged:
                     try:
-                        next_data_el = page.locator('script[id="__NEXT_DATA__"]')
-                        next_data_text = None
-                        if await next_data_el.count() > 0:
-                            next_data_text = await next_data_el.first.text_content()
-
-                        embedded_js = await page.evaluate("""() => {
-                            const keys = ['__INITIAL_STATE__', '__PRELOADED_STATE__', '__APP_STATE__', 'productData', 'product'];
-                            const res = {};
-                            for (const key of keys) {
-                                if (window[key]) {
-                                    try {
-                                        res[key] = typeof window[key] === 'string' ? window[key] : JSON.stringify(window[key]);
-                                    } catch(e) {}
-                                }
-                            }
-                            if (window.dataLayer) {
-                                try {
-                                    res['dataLayer'] = JSON.stringify(window.dataLayer);
-                                } catch(e) {}
-                            }
-                            return res;
-                        }""")
-                        pw_embedded = parse_playwright_embedded(next_data_text, embedded_js)
+                        embedded_data = extract_embedded_product(content)
+                        if embedded_data and embedded_data.get("name") and str(embedded_data["name"]).strip():
+                            merged = embedded_data
+                            method = "playwright_rendered_embedded_json"
                     except Exception as e:
-                        logger.debug("Playwright embedded extraction failed: %s", e)
+                        logger.debug("Playwright rendered embedded extraction failed: %s", e)
 
-                    if pw_embedded and pw_embedded.get("name") and str(pw_embedded["name"]).strip():
-                        merged = pw_embedded
-                        method = "playwright_embedded"
-                    else:
-                        # 3. Primary Playwright Extraction: DOM Parsing
-                        try:
-                            pw_dom = await page.evaluate("""() => {
-                                const getMeta = (names) => {
-                                    for (const name of names) {
-                                        const el = document.querySelector(`meta[property="${name}"], meta[name="${name}"]`);
-                                        if (el && el.getAttribute('content')) return el.getAttribute('content').trim();
-                                    }
-                                    return null;
-                                };
+                # 3. HTML parsing (BeautifulSoup) on rendered HTML
+                if not merged:
+                    try:
+                        html_data = extract_html_product(content, url)
+                        if html_data and html_data.get("name") and str(html_data["name"]).strip():
+                            merged = html_data
+                            method = "playwright_rendered_beautifulsoup"
+                    except Exception as e:
+                        logger.debug("Playwright rendered BeautifulSoup parsing failed: %s", e)
 
-                                const h1 = document.querySelector('h1');
-                                const name = h1 ? h1.textContent.trim() : document.title.trim();
-                                const brand = getMeta(['og:brand', 'product:brand', 'brand', 'product:brand:name']);
-                                const image = getMeta(['og:image', 'twitter:image', 'image']);
-                                const description = getMeta(['og:description', 'description']);
-                                const price = getMeta(['product:price:amount', 'og:price:amount', 'price:amount', 'price']);
-                                const currency = getMeta(['product:price:currency', 'og:price:currency', 'price:currency', 'currency']);
-                                const availability = getMeta(['product:availability', 'og:availability', 'availability']);
-
-                                return { name, brand, image, description, price, currency, availability };
-                            }""")
-                        except Exception as e:
-                            logger.debug("Playwright DOM extraction failed: %s", e)
-
-                        if pw_dom and pw_dom.get("name") and str(pw_dom["name"]).strip():
-                            merged = pw_dom
-                            method = "playwright_dom"
-                        else:
-                            # 4. Fallback to BeautifulSoup on page.content()
-                            logger.info("Playwright failed to identify product name. Falling back to BeautifulSoup.")
-                            bs_start = time.time()
-                            method = "playwright_beautifulsoup_fallback"
-                            
-                            content = await page.content()
-                            
-                            jsonld_data = None
-                            embedded_data = None
-                            html_data = None
-
-                            try:
-                                jsonld_data = extract_jsonld_product(content)
-                            except Exception:
-                                pass
-
-                            if jsonld_data and jsonld_data.get("name") and str(jsonld_data["name"]).strip():
-                                merged = jsonld_data
-                            else:
-                                try:
-                                    embedded_data = extract_embedded_product(content)
-                                except Exception:
-                                    pass
-
-                                if embedded_data and embedded_data.get("name") and str(embedded_data["name"]).strip():
-                                    merged = embedded_data
-                                else:
-                                    try:
-                                        html_data = extract_html_product(content, url)
-                                    except Exception:
-                                        pass
-                                    merged = merge_product_data(html_data, embedded_data, jsonld_data)
+                if not merged:
+                    logger.warning("All extraction methods failed on Playwright rendered content for %s", url)
+                    method = "playwright_failed"
 
                 pw_duration = time.time() - pw_start
 

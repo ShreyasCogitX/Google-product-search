@@ -196,10 +196,12 @@ async def async_google_batch_search(
         headless=config.PLAYWRIGHT_HEADLESS,
         timeout_ms=config.PLAYWRIGHT_TIMEOUT_MS,
         max_concurrent=config.MAX_PRODUCT_CONCURRENCY,
+        dom_wait_ms=getattr(config, "PLAYWRIGHT_DOM_WAIT_MS", 1500),
+        http_retry_count=getattr(config, "HTTP_RETRY_COUNT", 1),
     )
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=config.PLAYWRIGHT_HEADLESS)
+        browser = await p.chromium.launch(headless=config.PLAYWRIGHT_HEADLESS, args=["--no-sandbox", "--disable-gpu"])
         try:
             tasks = [
                 _process_single_query(q, limit, scraper, browser, query_semaphore)

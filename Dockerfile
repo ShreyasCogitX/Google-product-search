@@ -1,77 +1,54 @@
-# Dockerfile for Google Product Search (Render deployment)
+# Dockerfile for Google Product Search (Production / Render deployment)
 # -------------------------------------------------
-# 1️⃣ Base image – slim Python with apt support
+# 1️⃣ Base image – Python 3.11 slim
 # -------------------------------------------------
-FROM python:3.14-slim
+FROM python:3.11-slim
+
+# Prevent Python from writing .pyc files and enable unbuffered logging
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/src:/app \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    PORT=8000
+
+WORKDIR /app
 
 # -------------------------------------------------
-# 2️⃣ Install system libraries required by Chromium (headless)
+# 2️⃣ Install basic system dependencies
 # -------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    fonts-liberation \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libatk1.0-data \
-    libatspi2.0-0 \
-    libdbus-1-3 \
-    libdrm2 \
-    libgbm1 \
-    libglib2.0-0 \
-    libnspr4 \
-    libnss3 \
-    libpango-1.0-0 \
-    libpangocairo-1.0-0 \
-    libx11-6 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxrandr2 \
-    libxshmfence1 \
-    libxss1 \
-    libxtst6 \
-    lsb-release \
-    wget \
-    xdg-utils \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # -------------------------------------------------
-# 3️⃣ Create a non‑root user (safer runtime)
+# 3️⃣ Cache Python dependencies and Playwright Chromium
 # -------------------------------------------------
-RUN useradd -m appuser
-WORKDIR /app
-COPY --chown=appuser:appuser . /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    playwright install --with-deps chromium && \
+    rm -rf /var/lib/apt/lists/*
 
 # -------------------------------------------------
-# 4️⃣ Install Python requirements and Playwright browsers
+# 4️⃣ Create non-root user and grant browser permissions
 # -------------------------------------------------
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt && \
-    # Install Chromium and its OS deps (Playwright) at build time
-    playwright install chromium && \
-    playwright install-deps
+RUN useradd -m -u 1000 appuser && \
+    chmod -R 755 /ms-playwright
 
 # -------------------------------------------------
-# 5️⃣ Make Playwright reuse the installed browsers (cached location)
+# 5️⃣ Copy application code with non-root ownership
 # -------------------------------------------------
-ENV PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers
-RUN mkdir -p $PLAYWRIGHT_BROWSERS_PATH && \
-    cp -r /root/.cache/ms-playwright/* $PLAYWRIGHT_BROWSERS_PATH/
+COPY . /app
+RUN chown -R appuser:appuser /app
 
 # -------------------------------------------------
-# 6️⃣ Increase launch timeout (optional but recommended)
-# -------------------------------------------------
-ENV PLAYWRIGHT_TIMEOUT_MS=300000   # 5 minutes
-
-# -------------------------------------------------
-# 7️⃣ Switch to non‑root user, expose FastAPI port
+# 6️⃣ Switch to non-root user and expose port
 # -------------------------------------------------
 USER appuser
 EXPOSE 8000
 
 # -------------------------------------------------
-# 8️⃣ Start the FastAPI server (CLI entry point)
+# 7️⃣ Start FastAPI server
 # -------------------------------------------------
-CMD ["python", "src/main.py", "--serve"]
+CMD ["python", "src/main.py", "--serve", "--host", "0.0.0.0", "--port", "8000"]
